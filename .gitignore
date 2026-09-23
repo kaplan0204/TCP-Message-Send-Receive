@@ -1,0 +1,7 @@
+# Visual Studio user files, build output and downloaded files
+.vs/
+bin/
+obj/
+*.user
+*.suo
+AlinanDosyalar/
