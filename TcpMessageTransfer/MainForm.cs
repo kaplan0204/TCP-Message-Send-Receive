@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -14,7 +13,8 @@ namespace TcpMessageTransfer
     {
         private const byte MessagePacket = 1;
         private const byte FilePacket = 2;
-        private const int MaxPacketSize = 512 * 1024 * 1024;
+        private const int HeaderSize = 5;
+        private const long MaxFileSize = 512L * 1024 * 1024;
 
         private readonly TextBox hostBox = new TextBox { Text = "127.0.0.1", Width = 120 };
         private readonly NumericUpDown portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = 5000, Width = 70 };
@@ -26,12 +26,12 @@ namespace TcpMessageTransfer
         private readonly TextBox messageBox = new TextBox { Width = 420 };
         private readonly TextBox logBox = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
         private readonly Label statusLabel = new Label { Text = "Bağlı değil", AutoSize = true };
+        private readonly SemaphoreSlim sendLock = new SemaphoreSlim(1, 1);
         private string saveFolder;
         private TcpListener listener;
         private TcpClient client;
         private NetworkStream stream;
         private CancellationTokenSource cancellation;
-        private readonly SemaphoreSlim sendLock = new SemaphoreSlim(1, 1);
 
         public MainForm()
         {
@@ -40,7 +40,7 @@ namespace TcpMessageTransfer
             saveFolder = Path.Combine(Application.StartupPath, "AlinanDosyalar");
             Directory.CreateDirectory(saveFolder);
             BuildUi();
-            FormClosing += (s, e) => Disconnect();
+            FormClosing += async (s, e) => await DisconnectAsync();
         }
 
         private void BuildUi()
@@ -49,17 +49,16 @@ namespace TcpMessageTransfer
             top.Controls.Add(new Label { Text = "IP / Host:", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
             top.Controls.Add(hostBox);
             top.Controls.Add(new Label { Text = "Port:", AutoSize = true, Margin = new Padding(10, 8, 3, 3) });
-            top.Controls.Add(portBox); top.Controls.Add(startButton); top.Controls.Add(connectButton);
-            top.Controls.Add(statusLabel);
+            top.Controls.Add(portBox); top.Controls.Add(startButton); top.Controls.Add(connectButton); top.Controls.Add(statusLabel);
             startButton.Click += async (s, e) => await StartServerAsync();
             connectButton.Click += async (s, e) => await ConnectAsync();
 
-            var send = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48, Padding = new Padding(8) };
-            send.Controls.Add(messageBox); send.Controls.Add(sendMessageButton); send.Controls.Add(sendFileButton); send.Controls.Add(folderButton);
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48, Padding = new Padding(8) };
+            bottom.Controls.Add(messageBox); bottom.Controls.Add(sendMessageButton); bottom.Controls.Add(sendFileButton); bottom.Controls.Add(folderButton);
             sendMessageButton.Click += async (s, e) => await SendMessageAsync();
             sendFileButton.Click += async (s, e) => await SendFileAsync();
             folderButton.Click += ChooseFolder;
-            Controls.Add(logBox); Controls.Add(send); Controls.Add(top);
+            Controls.Add(logBox); Controls.Add(bottom); Controls.Add(top);
             Log("Hazır. Bir pencerede sunucuyu başlatın, diğerinde bağlanın.");
         }
 
@@ -67,14 +66,18 @@ namespace TcpMessageTransfer
         {
             try
             {
-                Disconnect(); cancellation = new CancellationTokenSource();
-                listener = new TcpListener(IPAddress.Any, (int)portBox.Value); listener.Start();
+                await DisconnectAsync();
+                cancellation = new CancellationTokenSource();
+                listener = new TcpListener(IPAddress.Any, (int)portBox.Value);
+                listener.Start();
                 Log("Sunucu başladı. Port: " + portBox.Value);
                 SetStatus("Bağlantı bekleniyor...");
                 client = await listener.AcceptTcpClientAsync();
-                stream = client.GetStream(); SetStatus("Bağlı"); Log("Karşı taraf bağlandı: " + client.Client.RemoteEndPoint);
+                stream = client.GetStream();
+                SetStatus("Bağlı"); Log("Karşı taraf bağlandı: " + client.Client.RemoteEndPoint);
                 _ = ReceiveLoopAsync(client, cancellation.Token);
             }
+            catch (OperationCanceledException) { }
             catch (Exception ex) { Log("Sunucu hatası: " + ex.Message); SetStatus("Hata"); }
         }
 
@@ -82,9 +85,12 @@ namespace TcpMessageTransfer
         {
             try
             {
-                Disconnect(); cancellation = new CancellationTokenSource();
-                client = new TcpClient(); await client.ConnectAsync(hostBox.Text.Trim(), (int)portBox.Value);
-                stream = client.GetStream(); SetStatus("Bağlı"); Log("Bağlanıldı: " + client.Client.RemoteEndPoint);
+                await DisconnectAsync();
+                cancellation = new CancellationTokenSource();
+                client = new TcpClient();
+                await client.ConnectAsync(hostBox.Text.Trim(), (int)portBox.Value);
+                stream = client.GetStream(); SetStatus("Bağlı");
+                Log("Bağlanıldı: " + client.Client.RemoteEndPoint);
                 _ = ReceiveLoopAsync(client, cancellation.Token);
             }
             catch (Exception ex) { Log("Bağlantı hatası: " + ex.Message); SetStatus("Hata"); }
@@ -94,14 +100,15 @@ namespace TcpMessageTransfer
         {
             try
             {
-                while (!token.IsCancellationRequested && tcp.Connected)
+                while (!token.IsCancellationRequested)
                 {
-                    byte[] header = await ReadExactlyAsync(tcp.GetStream(), 5, token);
+                    byte[] header = await ReadExactlyAsync(tcp.GetStream(), HeaderSize, token);
                     byte type = header[0]; int length = ReadInt32(header, 1);
-                    if (length < 0 || length > MaxPacketSize) throw new InvalidDataException("Geçersiz paket boyutu.");
-                    byte[] payload = await ReadExactlyAsync(tcp.GetStream(), length, token);
-                    if (type == MessagePacket) Log("Karşı taraf: " + Encoding.UTF8.GetString(payload));
-                    else if (type == FilePacket) ReceiveFile(payload);
+                    if (length < 0 || length > int.MaxValue - HeaderSize) throw new InvalidDataException("Geçersiz paket boyutu.");
+                    if (type == MessagePacket)
+                        Log("Karşı taraf: " + Encoding.UTF8.GetString(await ReadExactlyAsync(tcp.GetStream(), length, token)));
+                    else if (type == FilePacket)
+                        await ReceiveFileAsync(tcp.GetStream(), length, token);
                     else throw new InvalidDataException("Bilinmeyen paket türü.");
                 }
             }
@@ -109,23 +116,24 @@ namespace TcpMessageTransfer
             catch (Exception ex) { Log("Bağlantı kapandı: " + ex.Message); SetStatus("Bağlı değil"); }
         }
 
-        private void ReceiveFile(byte[] payload)
+        private async Task ReceiveFileAsync(NetworkStream input, int payloadLength, CancellationToken token)
         {
-            using (var ms = new MemoryStream(payload)) using (var br = new BinaryReader(ms, Encoding.UTF8))
-            {
-                int nameLength = br.ReadInt32(); if (nameLength < 1 || nameLength > 1024) throw new InvalidDataException("Dosya adı geçersiz.");
-                string name = Path.GetFileName(Encoding.UTF8.GetString(br.ReadBytes(nameLength)));
-                string path = Path.Combine(saveFolder, name);
-                if (File.Exists(path)) path = Path.Combine(saveFolder, Path.GetFileNameWithoutExtension(name) + "_" + DateTime.Now.ToString("yyyyMMddHHmmss") + Path.GetExtension(name));
-                File.WriteAllBytes(path, br.ReadBytes((int)(ms.Length - ms.Position)));
-                Log("Dosya alındı: " + path);
-            }
+            byte[] nameLengthBytes = await ReadExactlyAsync(input, 4, token);
+            int nameLength = ReadInt32(nameLengthBytes, 0);
+            if (nameLength < 1 || nameLength > 1024 || nameLength + 4 > payloadLength) throw new InvalidDataException("Dosya adı geçersiz.");
+            string name = Path.GetFileName(Encoding.UTF8.GetString(await ReadExactlyAsync(input, nameLength, token)));
+            long contentLength = payloadLength - 4L - nameLength;
+            if (contentLength < 0 || contentLength > MaxFileSize) throw new InvalidDataException("Dosya boyutu geçersiz.");
+            string path = GetUniquePath(name);
+            using (var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+                await CopyExactlyAsync(input, output, contentLength, token);
+            Log("Dosya alındı: " + path);
         }
 
         private async Task SendMessageAsync()
         {
             string text = messageBox.Text.Trim(); if (text.Length == 0) return;
-            try { await SendPacketAsync(MessagePacket, Encoding.UTF8.GetBytes(text)); Log("Ben: " + text); messageBox.Clear(); }
+            try { await SendPacketAsync(MessagePacket, Encoding.UTF8.GetBytes(text), cancellation.Token); Log("Ben: " + text); messageBox.Clear(); }
             catch (Exception ex) { Log("Mesaj gönderilemedi: " + ex.Message); }
         }
 
@@ -135,33 +143,71 @@ namespace TcpMessageTransfer
             using (var dialog = new OpenFileDialog())
             {
                 if (dialog.ShowDialog() != DialogResult.OK) return;
-                FileInfo info = new FileInfo(dialog.FileName);
-                if (info.Length > MaxPacketSize - 1024) { Log("Dosya çok büyük (en fazla 512 MB)."); return; }
-                byte[] name = Encoding.UTF8.GetBytes(info.Name); byte[] data = File.ReadAllBytes(dialog.FileName);
-                using (var ms = new MemoryStream()) using (var bw = new BinaryWriter(ms, Encoding.UTF8))
-                { bw.Write(name.Length); bw.Write(name); bw.Write(data); await SendPacketAsync(FilePacket, ms.ToArray()); }
-                Log("Dosya gönderildi: " + info.Name);
+                var info = new FileInfo(dialog.FileName);
+                byte[] name = Encoding.UTF8.GetBytes(info.Name);
+                long payloadLength = 4L + name.Length + info.Length;
+                if (info.Length > MaxFileSize || payloadLength > int.MaxValue) { Log("Dosya çok büyük (en fazla 512 MB)."); return; }
+                try
+                {
+                    await sendLock.WaitAsync(cancellation.Token);
+                    try
+                    {
+                        byte[] header = new byte[HeaderSize]; header[0] = FilePacket; WriteInt32(header, 1, (int)payloadLength);
+                        await stream.WriteAsync(header, 0, header.Length, cancellation.Token);
+                        byte[] nameLength = new byte[4]; WriteInt32(nameLength, 0, name.Length);
+                        await stream.WriteAsync(nameLength, 0, 4, cancellation.Token);
+                        await stream.WriteAsync(name, 0, name.Length, cancellation.Token);
+                        using (var input = new FileStream(dialog.FileName, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true))
+                            await input.CopyToAsync(stream, 81920, cancellation.Token);
+                        await stream.FlushAsync(cancellation.Token);
+                    }
+                    finally { sendLock.Release(); }
+                    Log("Dosya gönderildi: " + info.Name);
+                }
+                catch (Exception ex) { Log("Dosya gönderilemedi: " + ex.Message); }
             }
         }
 
-        private async Task SendPacketAsync(byte type, byte[] payload)
+        private async Task SendPacketAsync(byte type, byte[] payload, CancellationToken token)
         {
             if (stream == null) throw new InvalidOperationException("Bağlantı yok.");
-            byte[] header = new byte[5]; header[0] = type; WriteInt32(header, 1, payload.Length);
-            await sendLock.WaitAsync(); try { await stream.WriteAsync(header, 0, header.Length); await stream.WriteAsync(payload, 0, payload.Length); await stream.FlushAsync(); } finally { sendLock.Release(); }
+            byte[] header = new byte[HeaderSize]; header[0] = type; WriteInt32(header, 1, payload.Length);
+            await sendLock.WaitAsync(token);
+            try { await stream.WriteAsync(header, 0, header.Length, token); await stream.WriteAsync(payload, 0, payload.Length, token); await stream.FlushAsync(token); }
+            finally { sendLock.Release(); }
         }
 
-        private static async Task<byte[]> ReadExactlyAsync(NetworkStream s, int count, CancellationToken token)
+        private async Task DisconnectAsync()
         {
-            byte[] result = new byte[count]; int offset = 0;
-            while (offset < count) { int n = await s.ReadAsync(result, offset, count - offset, token); if (n == 0) throw new EndOfStreamException(); offset += n; }
-            return result;
+            try { cancellation?.Cancel(); listener?.Stop(); if (stream != null) await stream.FlushAsync(); stream?.Close(); client?.Close(); }
+            catch { }
+            finally { stream = null; client = null; listener = null; cancellation?.Dispose(); cancellation = null; SetStatus("Bağlı değil"); }
         }
+
+        private static async Task<byte[]> ReadExactlyAsync(NetworkStream input, int count, CancellationToken token)
+        {
+            byte[] data = new byte[count]; int offset = 0;
+            while (offset < count) { int read = await input.ReadAsync(data, offset, count - offset, token); if (read == 0) throw new EndOfStreamException(); offset += read; }
+            return data;
+        }
+
+        private static async Task CopyExactlyAsync(Stream input, Stream output, long count, CancellationToken token)
+        {
+            byte[] buffer = new byte[81920]; long remaining = count;
+            while (remaining > 0) { int wanted = (int)Math.Min(buffer.Length, remaining); int read = await input.ReadAsync(buffer, 0, wanted, token); if (read == 0) throw new EndOfStreamException(); await output.WriteAsync(buffer, 0, read, token); remaining -= read; }
+        }
+
+        private string GetUniquePath(string name)
+        {
+            string path = Path.Combine(saveFolder, name); int i = 1;
+            while (File.Exists(path)) { path = Path.Combine(saveFolder, Path.GetFileNameWithoutExtension(name) + "_" + i++ + Path.GetExtension(name)); }
+            return path;
+        }
+
         private static int ReadInt32(byte[] b, int i) { return (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]; }
         private static void WriteInt32(byte[] b, int i, int v) { b[i] = (byte)(v >> 24); b[i + 1] = (byte)(v >> 16); b[i + 2] = (byte)(v >> 8); b[i + 3] = (byte)v; }
         private void ChooseFolder(object sender, EventArgs e) { using (var d = new FolderBrowserDialog { SelectedPath = saveFolder }) if (d.ShowDialog() == DialogResult.OK) { saveFolder = d.SelectedPath; Log("Kayıt klasörü: " + saveFolder); } }
-        private void Disconnect() { try { cancellation?.Cancel(); stream?.Close(); client?.Close(); listener?.Stop(); } catch { } stream = null; client = null; listener = null; SetStatus("Bağlı değil"); }
         private void SetStatus(string text) { if (InvokeRequired) { BeginInvoke(new Action<string>(SetStatus), text); return; } statusLabel.Text = text; }
-        private void Log(string text) { if (InvokeRequired) { BeginInvoke(new Action<string>(Log), text); return; } logBox.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + text + Environment.NewLine); }
+        private void Log(string text) { if (IsDisposed) return; if (InvokeRequired) { BeginInvoke(new Action<string>(Log), text); return; } logBox.AppendText("[" + DateTime.Now.ToString("HH:mm:ss") + "] " + text + Environment.NewLine); }
     }
 }
